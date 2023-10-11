@@ -7,11 +7,7 @@ use arc_swap::ArcSwap;
 use atomic_float::AtomicF32;
 use carla::{
     client::{ActorBase, Vehicle},
-    rpc::{VehicleControl, VehicleWheelLocation},
-};
-use carla_ackermann::{
-    vehicle_control::{Output, TargetRequest},
-    VehicleController,
+    rpc::{VehicleAckermannControl, VehicleWheelLocation},
 };
 use cdr::{CdrLe, Infinite};
 use log::{debug, info};
@@ -41,9 +37,7 @@ pub struct VehicleBridge<'a> {
     publisher_turnindicator: Publisher<'a>,
     publisher_hazardlight: Publisher<'a>,
     speed: Arc<AtomicF32>,
-    controller: VehicleController,
     current_ackermann_cmd: Arc<ArcSwap<AckermannControlCommand>>,
-    current_gear: Arc<ArcSwap<u8>>,
 }
 
 impl<'a> VehicleBridge<'a> {
@@ -65,8 +59,6 @@ impl<'a> VehicleBridge<'a> {
         }
 
         info!("Detect a vehicle {vehicle_name}");
-        let physics_control = actor.physics_control();
-        let controller = VehicleController::from_physics_control(&physics_control, None);
 
         let publisher_velocity = z_session
             .declare_publisher(format!("{vehicle_name}/rt/vehicle/status/velocity_status"))
@@ -119,19 +111,13 @@ impl<'a> VehicleBridge<'a> {
                 cloned_cmd.store(Arc::new(cmd));
             })
             .res()?;
-        let current_gear = Arc::new(ArcSwap::from_pointee(gear_report::NONE));
-        let cloned_gear = current_gear.clone();
         let subscriber_gear_cmd = z_session
             .declare_subscriber(format!("{vehicle_name}/rt/control/command/gear_cmd"))
-            .callback_mut(move |sample| {
-                let result: Result<GearCommand, _> =
-                    cdr::deserialize_from(&*sample.payload.contiguous(), cdr::size::Infinite);
-                let Ok(cmd) = result else {
-                    return;
-                };
-                cloned_gear.store(Arc::new(cmd.command));
+            .callback_mut(move |_sample| {
+                // TODO: We don't this now, since reverse will be calculated while subscribing control_cmd
             })
             .res()?;
+
         let _subscriber_turnindicator = z_session
             .declare_subscriber(format!(
                 "{vehicle_name}/rt/control/command/turn_indicators_cmd"
@@ -161,9 +147,7 @@ impl<'a> VehicleBridge<'a> {
             publisher_turnindicator,
             publisher_hazardlight,
             speed,
-            controller,
             current_ackermann_cmd,
-            current_gear,
         })
     }
 
@@ -176,16 +160,11 @@ impl<'a> VehicleBridge<'a> {
         header.frame_id = String::from("base_link");
         let velocity_msg = VelocityReport {
             header,
-            // Since the velocity report from Carla is always positive, we need to check reverse.
-            longitudinal_velocity: if self.actor.control().reverse {
-                -velocity.norm()
-            } else {
-                velocity.norm()
-            },
+            longitudinal_velocity: velocity.norm(),
             lateral_velocity: 0.0,
             heading_rate: self
                 .actor
-                .get_wheel_steer_angle(VehicleWheelLocation::FL_Wheel)
+                .wheel_steer_angle(VehicleWheelLocation::FL_Wheel)
                 .to_radians()
                 * -1.0,
         };
@@ -205,11 +184,11 @@ impl<'a> VehicleBridge<'a> {
         let steer_msg = SteeringReport {
             stamp: Time {
                 sec: timestamp.floor() as i32,
-                nanosec: (timestamp.fract() * 1000_000_000_f64) as u32,
+                nanosec: (timestamp.fract() * 1_000_000_000_f64) as u32,
             },
             steering_tire_angle: self
                 .actor
-                .get_wheel_steer_angle(VehicleWheelLocation::FL_Wheel)
+                .wheel_steer_angle(VehicleWheelLocation::FL_Wheel)
                 .to_radians()
                 * -1.0,
         };
@@ -222,9 +201,9 @@ impl<'a> VehicleBridge<'a> {
         let gear_msg = GearReport {
             stamp: Time {
                 sec: timestamp.floor() as i32,
-                nanosec: (timestamp.fract() * 1000_000_000_f64) as u32,
+                nanosec: (timestamp.fract() * 1_000_000_000_f64) as u32,
             },
-            report: **self.current_gear.load(),
+            report: if self.actor.control().reverse { 20 } else { 2 }, /* TODO: Use enum (20: reverse, 2: drive) */
         };
         let encoded = cdr::serialize::<_, _, CdrLe>(&gear_msg, Infinite)?;
         self.publisher_gear.put(encoded).res()?;
@@ -235,9 +214,9 @@ impl<'a> VehicleBridge<'a> {
         let control_msg = ControlModeReport {
             stamp: Time {
                 sec: timestamp.floor() as i32,
-                nanosec: (timestamp.fract() * 1000_000_000_f64) as u32,
+                nanosec: (timestamp.fract() * 1_000_000_000_f64) as u32,
             },
-            mode: control_mode_report::AUTONOMOUS, // 1: AUTONOMOUS, 4: MANUAL. TODO: Now we don't have any way to switch these two modes.
+            mode: 1, /* 1: AUTONOMOUS, 4: MANUAL. TODO: Now we don't have any way to switch these two modes. */
         };
         let encoded = cdr::serialize::<_, _, CdrLe>(&control_msg, Infinite)?;
         self.publisher_control.put(encoded).res()?;
@@ -281,24 +260,13 @@ impl<'a> VehicleBridge<'a> {
                 },
             longitudinal:
                 LongitudinalCommand {
-                    mut speed,
-                    mut acceleration,
+                    speed,
+                    acceleration,
+                    jerk,
                     ..
                 },
             ..
         } = **self.current_ackermann_cmd.load();
-        match **self.current_gear.load() {
-            gear_report::DRIVE => { /* Do nothing */ }
-            gear_report::REVERSE => {
-                /* the speed from current_ackermann_cmd will be negative while reverse, so do nothing */
-            }
-            gear_report::PARK => {
-                /* Force the vehicle to stop */
-                speed = 0.0;
-                acceleration = 0.0;
-            }
-            _ => { /* Do nothing */ }
-        };
         debug!(
             "Autoware => Carla: speed:{} accel:{} steering_tire_angle:{}",
             speed,
@@ -307,41 +275,34 @@ impl<'a> VehicleBridge<'a> {
         );
         let current_speed = self.actor.velocity().norm();
         let (_, pitch_radians, _) = self.actor.transform().rotation.euler_angles();
-        self.controller.set_target(TargetRequest {
-            steering_angle: -steering_tire_angle.to_degrees() as f64,
-            speed: speed as f64,
-            accel: acceleration as f64,
-        });
+
+        let steer = {
+            let max_steer_angle = 69.999;
+            (-steering_tire_angle.to_degrees() / max_steer_angle).clamp(-1.0, 1.0)
+        };
+
+        // Compute the steering speed
+        let steer_speed = if steering_tire_angle.to_degrees().abs() < 3.0 {
+            0.0
+        } else if steering_tire_angle.to_degrees() > 0.0 {
+            0.1
+        } else {
+            -0.1
+        };
+
+        self.actor
+            .apply_ackermann_control(&VehicleAckermannControl {
+                steer,
+                steer_speed,
+                speed,
+                acceleration,
+                jerk,
+            });
+
         debug!(
             "Autoware => Carla: elapse_sec:{} current_speed:{} pitch_radians:{}",
             elapsed_sec, current_speed, pitch_radians
         );
-        let (
-            Output {
-                throttle,
-                brake,
-                steer,
-                reverse,
-                hand_brake,
-            },
-            _,
-        ) = self
-            .controller
-            .step(elapsed_sec, current_speed as f64, pitch_radians as f64);
-        debug!(
-            "Autoware => Carla: throttle:{}, brake:{}, steer:{}",
-            throttle, brake, steer
-        );
-
-        self.actor.apply_control(&VehicleControl {
-            throttle: throttle as f32,
-            steer: steer as f32,
-            brake: brake as f32,
-            hand_brake,
-            reverse,
-            manual_gear_shift: false,
-            gear: 0,
-        });
     }
 
     pub fn vehicle_name(&self) -> &str {
@@ -367,3 +328,4 @@ impl<'a> Drop for VehicleBridge<'a> {
         info!("Remove vehicle name {}", self.vehicle_name());
     }
 }
+
