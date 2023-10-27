@@ -18,8 +18,8 @@ use zenoh_ros_type::{
         AckermannControlCommand, AckermannLateralCommand, LongitudinalCommand,
     },
     autoware_auto_vehicle_msgs::{
-        control_mode_report, gear_report, hazard_lights_report, turn_indicators_report,
-        ControlModeReport, GearCommand, GearReport, HazardLightsReport, SteeringReport,
+        hazard_lights_report, turn_indicators_report,
+        ControlModeReport, GearReport, HazardLightsReport, SteeringReport,
         TurnIndicatorsReport, VelocityReport,
     },
     builtin_interfaces::Time,
